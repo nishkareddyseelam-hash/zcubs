@@ -1,0 +1,42 @@
+# Render Blueprint (D-018, docs/DECISION_LOG.md) — deploys the Next.js app
+# as a Render free-tier web service. See docs/DEPLOYMENT.md for the full
+# walkthrough, including WHY the database is not defined here (Render's own
+# free Postgres expires after 30 days — a Neon free-tier database, which
+# has no such expiry, is used instead and connected via DATABASE_URL below,
+# set manually in the Render dashboard so a real connection string is never
+# committed to this file or the repo).
+#
+# Real, current free-tier facts this file's comments rely on (verified via
+# Render's own docs as of writing — re-check before relying on them, terms
+# change):
+#   - Free web services: 512 MB RAM, 0.1 CPU, spin down after 15 minutes of
+#     no inbound traffic, ~1 minute cold-start on the next request, and a
+#     workspace-wide cap of 750 free instance-hours/month.
+#   - https://render.com/docs/free
+#
+# Deploy with the Render dashboard's "New > Blueprint" flow pointed at this
+# repo, or the Render CLI (`render blueprint launch`).
+
+services:
+  - type: web
+    name: zcubs-founder-os
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: npm ci && npm run db:migrate && npm run build
+    startCommand: npm start
+    healthCheckPath: /login
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEXTAUTH_URL
+        sync: false # set to your real Render URL (https://<service>.onrender.com) after first deploy
+      - key: NEXTAUTH_SECRET
+        generateValue: true # Render generates and stores a real random secret — never hardcoded here
+      - key: DATABASE_URL
+        sync: false # set manually to your Neon (or other) Postgres connection string — see docs/DEPLOYMENT.md
+      - key: ANTHROPIC_API_KEY
+        sync: false # optional — every AI call site fails soft without it (D-011)
+      - key: AI_GLOBAL_DAILY_CALL_CAP
+        value: "300"
