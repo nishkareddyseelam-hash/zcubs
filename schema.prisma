@@ -1,0 +1,707 @@
+// Z Cubs — Institutional Edition data model — DESIGN DOCUMENT.
+//
+// Status: this file documents the target relational shape (D-002 through
+// D-006 in docs/DECISION_LOG.md). It is NOT the executable schema. D-007
+// records why: Prisma's engine binaries (binaries.prisma.sh /
+// prisma-builds.s3-eu-west-1.amazonaws.com) are unreachable from this
+// sandbox's network allowlist (403 on every host, no local cache) — this
+// was hit and confirmed during implementation, not assumed. The actual
+// runtime schema is hand-written SQL DDL at prisma/migrations/001_init.sql,
+// modeling the exact same tables/relations/constraints described here, and
+// accessed through a typed `pg` (node-postgres) repository layer in
+// src/lib/pg.ts + src/lib/repo.ts. If this app is later deployed somewhere
+// with unrestricted network access, adopting the real Prisma CLI against
+// this same schema shape is a documented, low-risk follow-up (see
+// docs/ROADMAP.md) — the table shapes below and the SQL DDL are kept in
+// sync by hand in the meantime.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  ageBand      String   @default("founder") // "founder" (18+) | "explorer" (13-17)
+  createdAt    DateTime @default(now())
+
+  founderProfile    FounderProfile?
+  opportunities     Opportunity[]
+  experiments       Experiment[]
+  evidenceItems     EvidenceItem[]
+  risks             Risk[]
+  financialScenarios FinancialScenario[]
+  mentorMessages    MentorMessage[]
+  activityLog       ActivityLog[]
+  appState          AppState?
+  comparableCompanies ComparableCompany[]
+  ecosystemContacts EcosystemContact[]
+  businessPlan      BusinessPlan?
+  actualsLog        ActualsLog[]
+  dprInputs         DprInputs?
+  guideSteps        GuideStep[]
+  guideMeta         GuideMeta?
+
+  institutionMemberships InstitutionMembership[]
+  roleAssignments        RoleAssignment[]
+  cohortMemberships      CohortMembership[]
+  applications            Application[]           @relation("ApplicantUser")
+  evaluatorAssignments    EvaluatorAssignment[]
+  evaluations              Evaluation[]
+  auditEvents              AuditEvent[]
+
+  @@index([email])
+}
+
+// ---------------------------------------------------------------------
+// Tenancy hierarchy: GovernmentOrganisation -> Institution -> Programme
+// -> Cohort. VentureTeam/Venture link down into the founder domain below.
+// ---------------------------------------------------------------------
+
+model GovernmentOrganisation {
+  id        String   @id @default(uuid())
+  name      String
+  kind      String   @default("state_department") // state_department | central_ministry | psu | other
+  state     String   @default("")
+  createdAt DateTime @default(now())
+
+  institutions Institution[]
+
+  @@index([name])
+}
+
+model Institution {
+  id                 String   @id @default(uuid())
+  name               String
+  legalName          String   @default("")
+  institutionType    String   @default("university") // school | university | incubator | accelerator | government_programme
+  identifier         String   @default("") // e.g. AISHE code, UDISE code — self-declared, unverified unless InstitutionVerification says so
+  state               String  @default("")
+  district             String @default("")
+  contactEmail        String @default("")
+  ageGroupsServed     String  @default("") // free text/csv, e.g. "13-17,18-24"
+  preferredLanguage   String  @default("en")
+  timeZone            String  @default("Asia/Kolkata")
+  status               String @default("draft") // draft | verification_pending | active | suspended | archived
+  governmentOrgId      String?
+  governmentOrg        GovernmentOrganisation? @relation(fields: [governmentOrgId], references: [id])
+  brandingJson         String @default("{}")
+  createdAt            DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  verifications  InstitutionVerification[]
+  memberships    InstitutionMembership[]
+  programmes     Programme[]
+
+  @@index([governmentOrgId])
+  @@index([status])
+}
+
+// Verification history kept separate from the public-facing `status` field
+// so an institution can never be labeled "verified"/"government approved"
+// in the UI without a corresponding record here (see spec section 6).
+model InstitutionVerification {
+  id            String   @id @default(uuid())
+  institutionId String
+  institution   Institution @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  claim         String   // e.g. "AICTE approved", "IIC registered"
+  evidenceNote  String   @default("")
+  sourceDocRef  String   @default("") // pointer to an uploaded document, not the document itself
+  verifiedBy    String   @default("") // userId of platform/security admin who checked it
+  verifiedAt    DateTime?
+  status        String   @default("pending") // pending | confirmed | rejected
+  createdAt     DateTime @default(now())
+
+  @@index([institutionId])
+}
+
+// One row per (user, institution) — the base membership. Fine-grained role
+// is NOT stored here; see RoleAssignment. This table just answers
+// "is this user affiliated with this institution at all" and carries
+// membership-level facts (join date, status).
+model InstitutionMembership {
+  id            String   @id @default(uuid())
+  institutionId String
+  institution   Institution @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status        String   @default("active") // active | suspended | withdrawn
+  joinedAt      DateTime @default(now())
+
+  @@unique([institutionId, userId])
+  @@index([userId])
+}
+
+// D-005: uniform RBAC. scopeType + scopeId identify where the role applies;
+// requireRole() in src/lib/rbac.ts walks scopeType from narrow to broad.
+model RoleAssignment {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scopeType String   // "platform" | "government_org" | "institution" | "programme" | "cohort"
+  scopeId   String   // id of the GovernmentOrganisation/Institution/Programme/Cohort, or "platform" for platform scope
+  role      String   // e.g. "institution_administrator", "programme_manager", "faculty_facilitator", "evaluator", "mentor_coordinator", "explorer_founder", "adult_founder" ...
+  grantedBy String   @default("")
+  createdAt DateTime @default(now())
+
+  @@unique([userId, scopeType, scopeId, role])
+  @@index([userId])
+  @@index([scopeType, scopeId])
+}
+
+// ---------------------------------------------------------------------
+// Programme Builder
+// ---------------------------------------------------------------------
+
+model Programme {
+  id                String   @id @default(uuid())
+  institutionId     String
+  institution       Institution @relation(fields: [institutionId], references: [id], onDelete: Cascade)
+  title             String
+  description       String   @default("")
+  programmeType     String   @default("university_pre_incubation")
+  ageGroup          String   @default("18+")
+  eligibilityNote   String   @default("")
+  geography         String   @default("")
+  sectorFocus       String   @default("")
+  startDate         DateTime?
+  endDate           DateTime?
+  applicationOpensAt  DateTime?
+  applicationClosesAt DateTime?
+  cohortSizeTarget   Int?
+  deliveryMode        String @default("blended") // online | in_person | blended
+  status               String @default("draft") // draft | published | applications_open | applications_closed | running | completed | archived
+  visibility            String @default("institution_only") // public | invite_only | institution_only
+  dataRetentionNote     String @default("")
+  isDemonstration       Boolean @default(false)
+  createdAt              DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  weeks           ProgrammeWeek[]
+  cohorts         Cohort[]
+  applicationForm ApplicationForm?
+  rubric          EvaluationRubric?
+
+  @@index([institutionId])
+  @@index([status])
+}
+
+// The configurable 14-week journey (spec section 8). Seeded from a
+// template but fully editable per programme (reorder/replace/add/remove).
+model ProgrammeWeek {
+  id                String   @id @default(uuid())
+  programmeId       String
+  programme         Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+  weekNumber        Int
+  title             String
+  learningObjective String   @default("")
+  activitySummary   String   @default("")
+  founderDeliverable String  @default("")
+  facultyGuidance    String  @default("")
+  mentorPrompt        String @default("")
+  evidenceRequirement  String @default("")
+  reflectionQuestion    String @default("")
+  youthSafetyNote        String @default("")
+  deadline               DateTime?
+  createdAt               DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  @@unique([programmeId, weekNumber])
+  @@index([programmeId])
+}
+
+// ---------------------------------------------------------------------
+// Cohorts
+// ---------------------------------------------------------------------
+
+model Cohort {
+  id            String   @id @default(uuid())
+  programmeId   String
+  programme     Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+  name          String
+  status        String   @default("forming") // forming | active | completed | archived
+  startDate     DateTime?
+  endDate       DateTime?
+  isDemonstration Boolean @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  memberships CohortMembership[]
+  ventureTeams VentureTeam[]
+
+  @@index([programmeId])
+}
+
+model CohortMembership {
+  id         String   @id @default(uuid())
+  cohortId   String
+  cohort     Cohort   @relation(fields: [cohortId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roleInCohort String @default("founder") // founder | faculty_facilitator | mentor_coordinator
+  status     String   @default("active") // active | graduated | withdrawn | deferred
+  joinedAt   DateTime @default(now())
+
+  @@unique([cohortId, userId])
+  @@index([userId])
+}
+
+model VentureTeam {
+  id        String   @id @default(uuid())
+  cohortId  String?
+  cohort    Cohort?  @relation(fields: [cohortId], references: [id])
+  name      String
+  createdAt DateTime @default(now())
+
+  opportunities Opportunity[]
+
+  @@index([cohortId])
+}
+
+// ---------------------------------------------------------------------
+// Applications & evaluation
+// ---------------------------------------------------------------------
+
+model ApplicationForm {
+  id            String   @id @default(uuid())
+  programmeId   String   @unique
+  programme     Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+  isTeamAllowed Boolean  @default(true)
+  requiresGuardianConsent Boolean @default(false)
+  latePolicyNote String  @default("")
+  createdAt      DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  questions   ApplicationQuestion[]
+  applications Application[]
+}
+
+model ApplicationQuestion {
+  id        String   @id @default(uuid())
+  formId    String
+  form      ApplicationForm @relation(fields: [formId], references: [id], onDelete: Cascade)
+  order     Int
+  label     String
+  fieldType String   @default("text") // text | textarea | file | url | select | declaration
+  required  Boolean  @default(true)
+  optionsJson String @default("[]")
+
+  @@index([formId])
+}
+
+model Application {
+  id              String   @id @default(uuid())
+  formId          String
+  form            ApplicationForm @relation(fields: [formId], references: [id], onDelete: Cascade)
+  applicantUserId String
+  applicantUser   User     @relation("ApplicantUser", fields: [applicantUserId], references: [id])
+  answersJson     String   @default("{}")
+  status          String   @default("draft")
+  // draft | submitted | eligibility_review | eligible | ineligible |
+  // under_evaluation | clarification_requested | shortlisted | waitlisted |
+  // selected | not_selected | withdrawn | archived
+  submittedAt     DateTime?
+  eligibilityDecision EligibilityDecision?
+  createdAt        DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  evaluatorAssignments EvaluatorAssignment[]
+  evaluations           Evaluation[]
+  selectionDecision      SelectionDecision?
+
+  @@index([formId])
+  @@index([applicantUserId])
+  @@index([status])
+}
+
+model EligibilityDecision {
+  id            String   @id @default(uuid())
+  applicationId String   @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  eligible      Boolean
+  reason        String   @default("")
+  decidedBy     String   @default("")
+  decidedAt     DateTime @default(now())
+}
+
+model EvaluationRubric {
+  id          String   @id @default(uuid())
+  programmeId String   @unique
+  programme   Programme @relation(fields: [programmeId], references: [id], onDelete: Cascade)
+  isBlindReview Boolean @default(false)
+  createdAt    DateTime @default(now())
+
+  criteria EvaluationCriterion[]
+}
+
+model EvaluationCriterion {
+  id        String   @id @default(uuid())
+  rubricId  String
+  rubric    EvaluationRubric @relation(fields: [rubricId], references: [id], onDelete: Cascade)
+  label     String
+  weight    Int      @default(1)
+  kind      String   @default("human_judgement") // objective_eligibility_rule | human_judgement | derived_metric | ai_assisted_observation
+  order     Int      @default(0)
+
+  scores EvaluationScore[]
+
+  @@index([rubricId])
+}
+
+model EvaluatorAssignment {
+  id            String   @id @default(uuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  evaluatorUserId String
+  evaluatorUser   User   @relation(fields: [evaluatorUserId], references: [id])
+  status          String @default("assigned") // assigned | recused | completed
+  conflictDeclaration ConflictDeclaration?
+  createdAt        DateTime @default(now())
+
+  @@unique([applicationId, evaluatorUserId])
+  @@index([evaluatorUserId])
+}
+
+model ConflictDeclaration {
+  id                     String   @id @default(uuid())
+  evaluatorAssignmentId  String   @unique
+  evaluatorAssignment    EvaluatorAssignment @relation(fields: [evaluatorAssignmentId], references: [id], onDelete: Cascade)
+  hasConflict            Boolean
+  note                   String   @default("")
+  declaredAt             DateTime @default(now())
+}
+
+model Evaluation {
+  id            String   @id @default(uuid())
+  applicationId String
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  evaluatorUserId String
+  evaluatorUser   User   @relation(fields: [evaluatorUserId], references: [id])
+  reasoning       String @default("")
+  status          String @default("draft") // draft | submitted
+  submittedAt      DateTime?
+  createdAt         DateTime @default(now())
+
+  scores EvaluationScore[]
+
+  @@unique([applicationId, evaluatorUserId])
+  @@index([applicationId])
+}
+
+model EvaluationScore {
+  id           String   @id @default(uuid())
+  evaluationId String
+  evaluation   Evaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+  criterionId  String
+  criterion    EvaluationCriterion @relation(fields: [criterionId], references: [id], onDelete: Cascade)
+  score        Float
+
+  @@unique([evaluationId, criterionId])
+}
+
+// Immutable once written — see repo.ts recordSelectionDecision(), which
+// only ever inserts, never updates, and an audit event is written alongside.
+model SelectionDecision {
+  id            String   @id @default(uuid())
+  applicationId String   @unique
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  outcome       String   // selected | not_selected | waitlisted
+  reasoning     String   @default("")
+  decidedBy     String
+  decidedAt     DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------
+
+model AuditEvent {
+  id        String   @id @default(uuid())
+  actorUserId String?
+  actorUser   User?  @relation(fields: [actorUserId], references: [id])
+  action      String   // e.g. "institution.create", "application.select", "role.grant"
+  scopeType   String   @default("")
+  scopeId     String   @default("")
+  detailJson  String   @default("{}")
+  createdAt    DateTime @default(now())
+
+  @@index([actorUserId])
+  @@index([scopeType, scopeId])
+  @@index([action])
+}
+
+// ---------------------------------------------------------------------
+// Founder domain (migrated 1:1 from the pre-existing SQLite schema in
+// src/lib/db.ts, with institutionId/programmeId/cohortId/ventureTeamId
+// scoping added to Opportunity so a founder's venture work can be
+// correctly attributed to the programme/cohort it was created under —
+// see spec section 14 "the system must never mix ... records from
+// different ventures").
+// ---------------------------------------------------------------------
+
+model FounderProfile {
+  id         String   @id @default(uuid())
+  userId     String   @unique
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  strengths  String
+  develop    String
+  time       String
+  capital    String
+  risk       String   @default("Medium")
+  categories String
+  updatedAt  DateTime @updatedAt
+}
+
+model Opportunity {
+  id             String   @id @default(uuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ventureTeamId  String?
+  ventureTeam    VentureTeam? @relation(fields: [ventureTeamId], references: [id])
+  institutionId  String?  // denormalized for fast tenant-scoped queries/exports
+  programmeId    String?
+  cohortId       String?
+  title          String
+  customer       String
+  problem        String
+  evidenceClass  String   @default("assumption")
+  evidenceNote   String
+  difficulty     String   @default("Medium")
+  capital        String   @default("Medium")
+  mission        String
+  dimFit          Int     @default(5)
+  dimEvidence     Int     @default(5)
+  dimCustomer     Int     @default(5)
+  dimDefensibility Int    @default(5)
+  dimCapital       Int    @default(5)
+  dimMargin         Int   @default(5)
+  dimScale           Int  @default(5)
+  dimSocial           Int @default(5)
+  createdAt            DateTime @default(now())
+
+  @@index([userId])
+  @@index([institutionId])
+  @@index([programmeId])
+  @@index([cohortId])
+  @@index([ventureTeamId])
+}
+
+model Experiment {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  opportunityId String   @default("")
+  name          String
+  hypothesis    String
+  method        String
+  kpi           String
+  threshold     String
+  result        String   @default("")
+  metThreshold  String   @default("unknown")
+  stopRule      String   @default("")
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@index([opportunityId])
+}
+
+model EvidenceItem {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  opportunityId String   @default("")
+  claim         String
+  metric        String
+  evClass       String   @default("assumption")
+  publisher     String
+  url           String   @default("")
+  geography     String   @default("")
+  dataPeriod    String   @default("")
+  license       String   @default("")
+  accessDate    String   @default("")
+  supersedesId  String   @default("")
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+  @@index([opportunityId])
+}
+
+model Risk {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  risk       String
+  mitigation String
+  severity   String   @default("Medium")
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+}
+
+model FinancialScenario {
+  id                            String   @id @default(uuid())
+  userId                        String
+  user                          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scenario                      String
+  price                         Float    @default(0)
+  cac                           Float    @default(0)
+  churn                         Float    @default(0.06)
+  cogsPct                       Float    @default(0.35)
+  fixedMonthly                  Float    @default(0)
+  startUnits                    Float    @default(0)
+  growth                        Float    @default(0)
+  annualPriceGrowthPct          Float    @default(0)
+  annualCacInflationPct         Float    @default(0)
+  annualFixedCostInflationPct   Float    @default(0)
+  taxRatePct                    Float    @default(0)
+  startingCash                  Float    @default(0)
+  updatedAt                     DateTime @updatedAt
+
+  @@unique([userId, scenario])
+}
+
+model MentorMessage {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lens      String
+  role      String
+  content   String
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model ActivityLog {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      String
+  detail    String   @default("")
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model AppState {
+  userId              String @id
+  user                User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activeOpportunityId String @default("")
+}
+
+model ComparableCompany {
+  id              String   @id @default(uuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  opportunityId   String   @default("")
+  name            String
+  sourceUrl       String   @default("")
+  sourcePublisher String   @default("")
+  status          String   @default("unknown")
+  statusNote      String   @default("")
+  lastRechecked   String   @default("")
+  notes           String   @default("")
+  createdAt       DateTime @default(now())
+
+  @@index([userId])
+  @@index([opportunityId])
+}
+
+model EcosystemContact {
+  id                String   @id @default(uuid())
+  userId            String
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  opportunityId     String   @default("")
+  kind              String   @default("investor")
+  name              String
+  focus             String   @default("")
+  stage             String   @default("")
+  sourceUrl         String   @default("")
+  applicationStatus String   @default("not_started")
+  deadline          String   @default("")
+  notes             String   @default("")
+  createdAt         DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([userId])
+  @@index([opportunityId])
+}
+
+model BusinessPlan {
+  userId               String   @id
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  executiveSummary     String   @default("")
+  marketSection        String   @default("")
+  businessModelSection String   @default("")
+  goToMarketSection    String   @default("")
+  opsSection           String   @default("")
+  updatedAt             DateTime @updatedAt
+}
+
+model ActualsLog {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  opportunityId String   @default("")
+  period        String
+  revenue       Float    @default(0)
+  customers     Float    @default(0)
+  costs         Float    @default(0)
+  notes         String   @default("")
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, period])
+}
+
+model DprInputs {
+  userId                 String @id
+  user                   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  landBuilding           Float  @default(0)
+  machinery              Float  @default(0)
+  workingCapitalMargin   Float  @default(0)
+  preliminaryExpenses    Float  @default(0)
+  contingency            Float  @default(0)
+  promoterContribution   Float  @default(0)
+  termLoanAmount         Float  @default(0)
+  termLoanRatePct        Float  @default(0)
+  termLoanTenureYears    Float  @default(0)
+  wcLoanAmount           Float  @default(0)
+  wcLoanRatePct          Float  @default(0)
+  updatedAt               DateTime @updatedAt
+}
+
+model GuideStep {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stepId     String
+  fieldsJson String   @default("{}")
+  itemsJson  String   @default("{}")
+  notes      String   @default("")
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, stepId])
+}
+
+model GuideMeta {
+  userId        String @id
+  user          User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessName  String @default("")
+  templateLabel String @default("")
+  notes         String @default("")
+  customer      String @default("")
+  problem       String @default("")
+  mission       String @default("")
+  updatedAt      DateTime @updatedAt
+}
